@@ -17,6 +17,16 @@ import (
 
 const jinjaTag = "jinja"
 
+type undefinedValue struct {
+	strict bool
+	name   string
+}
+
+// UndefinedValue returns a value representing a missing Jinja value.
+func UndefinedValue(strict bool, name string) *Value {
+	return &Value{Val: reflect.ValueOf(undefinedValue{strict: strict, name: name})}
+}
+
 type Value struct {
 	Val  reflect.Value
 	Safe bool // used to indicate whether a Value needs explicit escaping in the template
@@ -111,9 +121,31 @@ func (v *Value) IsIterable() bool {
 	return v.IsString() || v.IsList() || v.IsDict()
 }
 
-// IsNil checks whether the underlying value is nil
+// IsNil checks whether the underlying value is Jinja None.
 func (v *Value) IsNil() bool {
 	return !v.getResolvedValue().IsValid()
+}
+
+// IsUndefined checks whether the value came from a missing lookup.
+func (v *Value) IsUndefined() bool {
+	resolved := v.getResolvedValue()
+	return resolved.IsValid() && resolved.Type() == reflect.TypeFor[undefinedValue]()
+}
+
+// IsStrictUndefined reports whether using this missing value must fail.
+func (v *Value) IsStrictUndefined() bool {
+	if !v.IsUndefined() {
+		return false
+	}
+	return v.getResolvedValue().Interface().(undefinedValue).strict
+}
+
+func (v *Value) undefinedError() error {
+	name := v.getResolvedValue().Interface().(undefinedValue).name
+	if name == "" {
+		return errors.New("value is undefined")
+	}
+	return errors.Errorf("%s is undefined", name)
 }
 
 func (v *Value) IsError() bool {
@@ -219,10 +251,12 @@ func (v *Value) ToGoSimpleType(allowInterfaceKeys bool) any {
 //  5. time.Time
 //  6. String() will be called on the underlying value if provided
 //
-// nil values will lead to an empty string. For unsupported types, String will
-// return to the type's name.
+// None renders as "None", Undefined as "", and unsupported types by name.
 func (v *Value) String() string {
 	if v.IsNil() {
+		return "None"
+	}
+	if v.IsUndefined() {
 		return ""
 	}
 	if v.Val.IsValid() && v.Val.CanInterface() {
@@ -274,6 +308,8 @@ func (v *Value) String() string {
 			}
 			if item.IsString() {
 				out.WriteString(fmt.Sprintf(`'%s'`, item.String()))
+			} else if item.IsUndefined() {
+				out.WriteString("Undefined")
 			} else {
 				out.WriteString(item.String())
 			}
@@ -293,7 +329,11 @@ func (v *Value) String() string {
 			for value.Kind() == reflect.Interface {
 				value = reflect.ValueOf(value.Interface())
 			}
-			valueLabel := ToValue(value).String()
+			item := ToValue(value)
+			valueLabel := item.String()
+			if item.IsUndefined() {
+				valueLabel = "Undefined"
+			}
 			if value.Kind() == reflect.String {
 				valueLabel = fmt.Sprintf(`'%s'`, valueLabel)
 			}
@@ -483,7 +523,7 @@ func (v *Value) Bool() bool {
 //
 // In any other case, IsTrue returns false.
 func (v *Value) IsTrue() bool {
-	if v.IsNil() || v.IsError() {
+	if v.IsNil() || v.IsUndefined() || v.IsError() {
 		return false
 	}
 	switch v.getResolvedValue().Kind() {
@@ -515,7 +555,7 @@ func (v *Value) IsTrue() bool {
 //
 //	AsValue(1).Negate().IsTrue() == false
 func (v *Value) Negate() *Value {
-	if v.IsNil() || v.IsError() {
+	if v.IsNil() || v.IsUndefined() || v.IsError() {
 		return AsValue(true)
 	}
 	switch v.getResolvedValue().Kind() {
@@ -620,14 +660,38 @@ func (v *Value) Index(i int) *Value {
 //
 //	AsValue("Hello, World!").Contains(AsValue("World")) == true
 func (v *Value) Contains(other *Value) bool {
+	contained, _ := v.ContainsChecked(other)
+	return contained
+}
+
+// ContainsChecked performs containment while preserving strict undefined errors.
+func (v *Value) ContainsChecked(other *Value) (bool, error) {
+	if v.IsStrictUndefined() {
+		return false, v.undefinedError()
+	}
+	if v.IsUndefined() {
+		return false, nil
+	}
+	if v.IsNil() {
+		return false, errors.New("None is not iterable")
+	}
 	resolved := v.getResolvedValue()
+	if other.IsStrictUndefined() {
+		switch resolved.Kind() {
+		case reflect.Array, reflect.Slice:
+			if resolved.Len() == 0 {
+				return false, nil
+			}
+		}
+		return false, other.undefinedError()
+	}
 	switch resolved.Kind() {
 	case reflect.Struct:
 		if dict, ok := resolved.Interface().(Dict); ok {
-			return dict.Keys().Contains(other)
+			return dict.Keys().Contains(other), nil
 		}
 		fieldValue := resolved.FieldByName(other.String())
-		return fieldValue.IsValid()
+		return fieldValue.IsValid(), nil
 	case reflect.Map:
 		var mapValue reflect.Value
 		switch other.Interface().(type) {
@@ -639,30 +703,33 @@ func (v *Value) Contains(other *Value) bool {
 			if logging.Enabled() {
 				log.Errorf("Value.Contains() does not support lookup type '%s'\n", other.getResolvedValue().Kind().String())
 			}
-			return false
+			return false, nil
 		}
 
-		return mapValue.IsValid()
+		return mapValue.IsValid(), nil
 	case reflect.String:
-		return strings.Contains(resolved.String(), other.String())
+		if other.IsNil() || other.IsUndefined() {
+			return false, errors.New("string containment requires a string")
+		}
+		return strings.Contains(resolved.String(), other.String()), nil
 
 	case reflect.Slice, reflect.Array:
-		if vl, ok := resolved.Interface().(ValuesList); ok {
-			return vl.Contains(other)
-		}
 		for i := 0; i < resolved.Len(); i++ {
-			item := resolved.Index(i)
-			if other.EqualValueTo(ToValue(item)) {
-				return true
+			item := ToValue(resolved.Index(i))
+			if item.IsStrictUndefined() {
+				return false, item.undefinedError()
+			}
+			if other.EqualValueTo(item) {
+				return true, nil
 			}
 		}
-		return false
+		return false, nil
 
 	default:
 		if logging.Enabled() {
 			log.Errorf("Value.Contains() not available for type: %s\n", resolved.Kind().String())
 		}
-		return false
+		return false, nil
 	}
 }
 
@@ -694,6 +761,10 @@ func (v *Value) Iterate(fn func(idx, count int, key, value *Value) bool, empty f
 // not affect the iteration through a map because maps don't have any particular order.
 // However, you can force an order using the `sorted` keyword (and even use `reversed sorted`).
 func (v *Value) IterateOrder(fn func(idx, count int, key, value *Value) bool, empty func(), reverse bool, sorted bool, caseSensitive bool) {
+	if v.IsNil() || v.IsUndefined() {
+		empty()
+		return
+	}
 	resolved := v.getResolvedValue()
 	switch resolved.Kind() {
 	case reflect.Map:
@@ -863,6 +934,9 @@ func (v *Value) IterateOrder(fn func(idx, count int, key, value *Value) bool, em
 
 // Interface returns the underlying value.
 func (v *Value) Interface() any {
+	if v.IsNil() {
+		return nil
+	}
 	if v.Val.IsValid() && v.Val.CanInterface() {
 		return v.Val.Interface()
 	}
@@ -871,6 +945,13 @@ func (v *Value) Interface() any {
 
 // EqualValueTo checks whether two values are equal.
 func (v *Value) EqualValueTo(other *Value) bool {
+	if v.IsUndefined() || other.IsUndefined() {
+		return v.IsUndefined() && other.IsUndefined()
+	}
+	// Compare named string types by text.
+	if v.IsString() && other.IsString() {
+		return v.String() == other.String()
+	}
 	// comparison of uint with int fails using .Interface()-comparison (see issue #64)
 	if v.IsInteger() && other.IsInteger() {
 		return v.Integer() == other.Integer()
@@ -961,6 +1042,9 @@ func (v *Value) Keys() ValuesList {
 func (v *Value) Items() []*Pair {
 	out := []*Pair{}
 	resolved := v.getResolvedValue()
+	if resolved.IsValid() && resolved.Type() == TypeDict {
+		return append(out, resolved.Interface().(Dict).Pairs...)
+	}
 	if resolved.Kind() != reflect.Map {
 		return out
 	}
@@ -1216,7 +1300,11 @@ func (vl ValuesList) String() string {
 		if key.IsString() {
 			out.WriteString("'")
 		}
-		out.WriteString(key.String())
+		if key.IsUndefined() {
+			out.WriteString("Undefined")
+		} else {
+			out.WriteString(key.String())
+		}
 		if key.IsString() {
 			out.WriteString("'")
 		}
@@ -1243,6 +1331,8 @@ func (p *Pair) String() string {
 	}
 	if p.Value.IsString() {
 		value = fmt.Sprintf(`'%s'`, p.Value.String())
+	} else if p.Value.IsUndefined() {
+		value = "Undefined"
 	} else {
 		value = p.Value.String()
 	}
